@@ -18,7 +18,66 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+# Filler words stripped from the description after price/size are removed.
+_STOPWORDS = {
+    "a", "an", "the", "for", "in", "im", "i", "m", "looking", "want", "need",
+    "find", "me", "some", "something", "that", "is", "are", "under", "below",
+    "less", "than", "around", "about", "size", "sized", "and", "with", "to",
+    "of", "please", "show",
+}
+
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract description, size, and max_price from a natural-language query.
+
+    - max_price: a "$NN" / "under NN" / "below NN" pattern → float, else None.
+    - size:      a "size X" token (S/M/L/XL or a number) → str, else None.
+    - description: the remaining words with price/size phrases and filler removed.
+    """
+    text = query or ""
+    lowered = text.lower()
+
+    # --- max_price -----------------------------------------------------------
+    max_price = None
+    price_match = re.search(
+        r"(?:under|below|less than|<=?|\$)\s*\$?\s*(\d+(?:\.\d+)?)", lowered
+    )
+    if not price_match:
+        # Bare "$30" without a leading keyword.
+        price_match = re.search(r"\$\s*(\d+(?:\.\d+)?)", lowered)
+    if price_match:
+        max_price = float(price_match.group(1))
+
+    # --- size ----------------------------------------------------------------
+    size = None
+    size_match = re.search(
+        r"size\s+(xxs|xs|s|m|l|xl|xxl|\d+(?:\.\d+)?)", lowered
+    )
+    if size_match:
+        size = size_match.group(1).upper()
+
+    # --- description ---------------------------------------------------------
+    # Strip out the phrases we already consumed, then drop filler/numbers.
+    cleaned = lowered
+    cleaned = re.sub(
+        r"(?:under|below|less than|<=?)\s*\$?\s*\d+(?:\.\d+)?", " ", cleaned
+    )
+    cleaned = re.sub(r"\$\s*\d+(?:\.\d+)?", " ", cleaned)
+    cleaned = re.sub(r"size\s+(?:xxs|xs|s|m|l|xl|xxl|\d+(?:\.\d+)?)", " ", cleaned)
+
+    words = re.findall(r"[a-z0-9']+", cleaned)
+    desc_words = [w for w in words if w not in _STOPWORDS and not w.isdigit()]
+    description = " ".join(desc_words).strip()
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +151,53 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: Initialize the session.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse the query into description / size / max_price.
+    session["parsed"] = _parse_query(query)
+    if not session["parsed"]["description"]:
+        session["error"] = (
+            "I couldn't tell what you're looking for. Try naming the item, "
+            "e.g. 'vintage graphic tee under $30, size M'."
+        )
+        return session
+
+    # Step 3: Search. Branch on the result — empty means early exit.
+    session["search_results"] = search_listings(**session["parsed"])
+    if not session["search_results"]:
+        parsed = session["parsed"]
+        filters = []
+        if parsed["max_price"] is not None:
+            filters.append(f"under ${parsed['max_price']:g}")
+        if parsed["size"] is not None:
+            filters.append(f"in size {parsed['size']}")
+        filter_text = (" " + " ".join(filters)) if filters else ""
+        session["error"] = (
+            f"No matches for '{parsed['description']}'{filter_text}. "
+            "Try raising your budget, dropping the size filter, or broader keywords."
+        )
+        # Do NOT call suggest_outfit / create_fit_card with empty input.
+        return session
+
+    # Step 4: Select the top-ranked item.
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 5: Suggest an outfit (empty wardrobe → general advice, not an error).
+    try:
+        session["outfit_suggestion"] = suggest_outfit(
+            session["selected_item"], session["wardrobe"]
+        )
+    except Exception as exc:
+        session["error"] = f"Couldn't generate styling advice: {exc}"
+        return session
+
+    # Step 6: Create the shareable fit card.
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 7: Return the completed session.
     return session
 
 

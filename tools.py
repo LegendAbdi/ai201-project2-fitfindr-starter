@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -69,8 +70,44 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Build the set of keywords from the description (lowercased, words only).
+    keywords = [w for w in re.findall(r"[a-z0-9]+", (description or "").lower())]
+
+    scored: list[tuple[int, dict]] = []
+    for item in listings:
+        # Price filter (inclusive). Skip if over budget.
+        if max_price is not None and item.get("price", float("inf")) > max_price:
+            continue
+
+        # Size filter, case-insensitive substring match ("M" matches "S/M").
+        if size is not None:
+            item_size = (item.get("size") or "").lower()
+            if size.lower() not in item_size:
+                continue
+
+        # Score by keyword overlap against title, description, and style_tags.
+        haystack = " ".join(
+            [
+                item.get("title", ""),
+                item.get("description", ""),
+                " ".join(item.get("style_tags", [])),
+            ]
+        ).lower()
+        haystack_words = set(re.findall(r"[a-z0-9]+", haystack))
+
+        score = sum(1 for kw in keywords if kw in haystack_words)
+
+        # Drop listings with no keyword match.
+        if score == 0:
+            continue
+
+        scored.append((score, item))
+
+    # Sort by score, highest first (stable — preserves dataset order on ties).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +137,62 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    client = _get_groq_client()
+
+    # Describe the new item for the prompt.
+    item_desc = (
+        f"- Title: {new_item.get('title', 'Unknown item')}\n"
+        f"- Category: {new_item.get('category', 'n/a')}\n"
+        f"- Colors: {', '.join(new_item.get('colors', [])) or 'n/a'}\n"
+        f"- Style tags: {', '.join(new_item.get('style_tags', [])) or 'n/a'}\n"
+        f"- Description: {new_item.get('description', '')}"
+    )
+
+    items = wardrobe.get("items", []) if wardrobe else []
+
+    if not items:
+        # Empty wardrobe → general styling advice, not an error.
+        prompt = (
+            "You are a thrift-savvy personal stylist. A shopper is considering "
+            "this secondhand item but hasn't told you what's in their closet:\n\n"
+            f"{item_desc}\n\n"
+            "Suggest 1-2 complete outfit ideas built around this piece. Since you "
+            "don't know their wardrobe, recommend the kinds of items that pair well "
+            "(by category, color, and vibe) and describe what overall look it suits. "
+            "Keep it to a short, friendly paragraph."
+        )
+    else:
+        # Format the wardrobe so the LLM can name real pieces.
+        wardrobe_lines = []
+        for w in items:
+            colors = ", ".join(w.get("colors", []))
+            tags = ", ".join(w.get("style_tags", []))
+            line = f"- {w.get('name', 'item')} ({w.get('category', 'n/a')})"
+            if colors:
+                line += f" — colors: {colors}"
+            if tags:
+                line += f" — tags: {tags}"
+            wardrobe_lines.append(line)
+        wardrobe_text = "\n".join(wardrobe_lines)
+
+        prompt = (
+            "You are a thrift-savvy personal stylist. A shopper is considering "
+            "this secondhand item:\n\n"
+            f"{item_desc}\n\n"
+            "Here is what they already own:\n"
+            f"{wardrobe_text}\n\n"
+            "Suggest 1-2 complete outfits that pair the new item with SPECIFIC "
+            "named pieces from their wardrobe above. Reference the actual items by "
+            "name. End with one short styling tip. Keep it to a short, friendly "
+            "paragraph."
+        )
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+    )
+    return response.choices[0].message.content.strip()
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +224,38 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # Guard against an empty or whitespace-only outfit string.
+    if not outfit or not outfit.strip():
+        return (
+            "Can't create a fit card — no outfit suggestion was provided. "
+            "Generate an outfit with suggest_outfit() first."
+        )
+
+    client = _get_groq_client()
+
+    title = new_item.get("title", "this thrifted find")
+    price = new_item.get("price")
+    price_str = f"${price:g}" if price is not None else "a steal"
+    platform = new_item.get("platform", "secondhand")
+
+    prompt = (
+        "Write a short, shareable Instagram/TikTok caption for a thrifted find — "
+        "like a real OOTD or thrift-haul post, NOT a product description.\n\n"
+        f"Item: {title}\n"
+        f"Price: {price_str}\n"
+        f"Platform: {platform}\n"
+        f"Outfit it's styled in: {outfit}\n\n"
+        "Rules:\n"
+        "- 2 to 4 sentences, casual and authentic (lowercase, an emoji or two is fine).\n"
+        f"- Mention the item name, the price ({price_str}), and the platform "
+        f"({platform}) naturally, once each.\n"
+        "- Capture the outfit's vibe in specific terms.\n"
+        "Return only the caption text."
+    )
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=1.0,
+    )
+    return response.choices[0].message.content.strip()
